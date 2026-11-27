@@ -1,0 +1,7 @@
+.venv
+data
+reports
+docs
+tests
+bench
+.git
