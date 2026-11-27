@@ -11,7 +11,7 @@ import torch
 
 from .block_manager import BlockManager
 from .config import EngineConfig
-from .model import GPT2, BatchInput, KVCache
+from .model import GPT2, AttnGroup, BatchInput, KVCache
 from .sampler import Sampler
 from .scheduler import Scheduler, SchedulerOutput
 from .sequence import SamplingParams, Sequence, SeqStatus
@@ -85,29 +85,49 @@ class LLMEngine:
 
     # ------------------------------------------------------------------ batch
     def _build_batch(self, sched: SchedulerOutput) -> BatchInput:
+        """Flatten the scheduled tokens and group sequences for attention.
+
+        Decodes (1 new token) and prefill chunks (>1) go in separate
+        attention groups so that neither is padded to the other's length.
+        """
         bs = self.cfg.block_size
-        B = len(sched.scheduled)
-        Q = max(n for _, n in sched.scheduled)
-        max_blocks = max(len(s.block_table) for s, _ in sched.scheduled)
-        tokens = torch.zeros(B, Q, dtype=torch.long)
-        positions = torch.zeros(B, Q, dtype=torch.long)
-        slots = torch.full((B, Q), -1, dtype=torch.long)
-        tables = torch.zeros(B, max_blocks, dtype=torch.long)
-        ctx = torch.zeros(B, dtype=torch.long)
-        last = torch.zeros(B, dtype=torch.long)
-        for b, (seq, n) in enumerate(sched.scheduled):
+        tokens: List[int] = []
+        positions: List[int] = []
+        slots: List[int] = []
+        last: List[int] = []
+        spans = []  # (flat start, n, seq)
+        for seq, n in sched.scheduled:
             start = seq.num_computed_tokens
-            ids = seq.all_token_ids[start:start + n]
-            pos = torch.arange(start, start + n)
-            table = torch.tensor(seq.block_table, dtype=torch.long)
-            tokens[b, :n] = torch.tensor(ids, dtype=torch.long)
-            positions[b, :n] = pos
-            slots[b, :n] = table[pos // bs] * bs + pos % bs
-            tables[b, :len(seq.block_table)] = table
-            ctx[b] = start + n
-            last[b] = n - 1
+            flat = len(tokens)
+            tokens.extend(seq.all_token_ids[start:start + n])
+            for p in range(start, start + n):
+                positions.append(p)
+                slots.append(seq.block_table[p // bs] * bs + p % bs)
+            last.append(flat + n - 1)
+            spans.append((flat, n, seq))
+
         dev = self.device
-        return BatchInput(tokens.to(dev), positions.to(dev), slots.to(dev), tables.to(dev), ctx.to(dev), last.to(dev))
+        groups = []
+        for members in ([s for s in spans if s[1] == 1], [s for s in spans if s[1] > 1]):
+            if not members:
+                continue
+            Bg, Qg = len(members), max(n for _, n, _ in members)
+            nb = max(len(seq.block_table) for _, _, seq in members)
+            index = torch.zeros(Bg, Qg, dtype=torch.long)
+            valid = torch.zeros(Bg, Qg, dtype=torch.bool)
+            pos = torch.zeros(Bg, Qg, dtype=torch.long)
+            tables = torch.zeros(Bg, nb, dtype=torch.long)
+            ctx = torch.zeros(Bg, dtype=torch.long)
+            for b, (flat, n, seq) in enumerate(members):
+                c = seq.num_computed_tokens
+                index[b, :n] = torch.arange(flat, flat + n)
+                valid[b, :n] = True
+                pos[b, :n] = torch.arange(c, c + n)
+                tables[b, :len(seq.block_table)] = torch.tensor(seq.block_table)
+                ctx[b] = c + n
+            groups.append(AttnGroup(index.to(dev), valid.to(dev), pos.to(dev), tables.to(dev), ctx.to(dev)))
+        as_t = lambda xs: torch.tensor(xs, dtype=torch.long, device=dev)  # noqa: E731
+        return BatchInput(as_t(tokens), as_t(positions), as_t(slots), groups, as_t(last))
 
     # ------------------------------------------------------------------- step
     def step(self) -> StepOutput:
@@ -127,7 +147,7 @@ class LLMEngine:
         st = self.stats
         st.steps += 1
         st.busy_time_s += now - t0
-        st.padded_query_slots += batch.tokens.numel()
+        st.padded_query_slots += sum(g.index.numel() for g in batch.groups)
         st.batch_size_samples.append(len(sched.scheduled))
 
         for b, (seq, n) in enumerate(sched.scheduled):

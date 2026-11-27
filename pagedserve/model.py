@@ -1,18 +1,24 @@
 """GPT-2 forward pass that reads and writes a paged KV cache.
 
-The whole running batch is processed in one call. Every sequence contributes
-``q_len`` new tokens (1 for decode, up to the chunk size for prefill), padded
-to the longest one. For each layer the new keys/values are scattered into
-their cache slots, then each sequence's full context is gathered back through
-its block table and attended to with a causal mask built from token
-positions. Prefill, chunked prefill, recomputation after preemption and
-decode are therefore all the same code path.
+The whole running batch is processed in one call, with no padding in the
+token dimension: the new tokens of all sequences (1 for a decode, up to the
+chunk size for a prefill) are concatenated into one flat ``[T, E]`` tensor,
+so the QKV projection, output projection and MLP run as single matmuls.
+
+Only attention needs per-sequence structure. Sequences are split into
+*attention groups* (decodes, and prefill chunks) and each group is padded
+to its own longest query length, so a 512-token prefill chunk never forces
+the 1-token decodes in the same step to be padded to 512. For each layer
+the new keys/values are scattered into their cache slots, each sequence's
+context is gathered through its block table, and a causal mask built from
+token positions is applied. Prefill, chunked prefill, recomputation after
+preemption and decode all share this code path.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -22,21 +28,32 @@ from .config import ModelConfig
 
 
 @dataclass
-class BatchInput:
-    """Tensors describing one engine step (B sequences, Q = max new tokens).
+class AttnGroup:
+    """Sequences attended together (Bg sequences, Qg = longest query).
 
-    tokens, positions, slot_mapping: [B, Q]; padded entries have
-        slot_mapping == -1.
-    block_tables: [B, max_blocks] physical block ids (padded with 0).
-    context_lens: [B] total tokens in the cache after this step.
-    last_index: [B] index of each sequence's last real query token.
+    index: [Bg, Qg] position of each query token in the flat batch (pad 0).
+    valid: [Bg, Qg] False for padding.
+    positions: [Bg, Qg] absolute token positions (pad 0).
+    block_tables: [Bg, max_blocks] physical block ids (padded with 0).
+    context_lens: [Bg] tokens in the cache after this step.
     """
+
+    index: torch.Tensor
+    valid: torch.Tensor
+    positions: torch.Tensor
+    block_tables: torch.Tensor
+    context_lens: torch.Tensor
+
+
+@dataclass
+class BatchInput:
+    """One engine step. tokens/positions/slot_mapping are flat ``[T]``;
+    ``last_index[b]`` is the flat index of sequence b's last new token."""
 
     tokens: torch.Tensor
     positions: torch.Tensor
     slot_mapping: torch.Tensor
-    block_tables: torch.Tensor
-    context_lens: torch.Tensor
+    groups: List[AttnGroup]
     last_index: torch.Tensor
 
 
@@ -71,29 +88,30 @@ class Block(nn.Module):
         return self.mlp_proj(F.gelu(self.c_fc(self.ln_2(x)), approximate="tanh"))
 
     def forward_paged(self, x: torch.Tensor, batch: BatchInput, k_cache: torch.Tensor,
-                      v_cache: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
-        B, Q, E = x.shape
+                      v_cache: torch.Tensor, masks: List[torch.Tensor]) -> torch.Tensor:
+        T, E = x.shape
         H, D = self.cfg.n_head, self.cfg.head_dim
         q, k, v = self.c_attn(self.ln_1(x)).split(E, dim=-1)
-        q = q.view(B, Q, H, D)
-        k = k.view(B, Q, H, D)
-        v = v.view(B, Q, H, D)
+        q, k, v = q.reshape(T, H, D), k.reshape(T, H, D), v.reshape(T, H, D)
 
-        # 1) scatter new K/V into their physical slots
-        valid = batch.slot_mapping >= 0
-        slots = batch.slot_mapping[valid]
-        k_cache.view(-1, H, D)[slots] = k[valid]
-        v_cache.view(-1, H, D)[slots] = v[valid]
+        # 1) scatter the new K/V into their physical slots
+        k_cache.view(-1, H, D)[batch.slot_mapping] = k
+        v_cache.view(-1, H, D)[batch.slot_mapping] = v
 
-        # 2) gather each sequence's whole context through its block table
-        nb = batch.block_tables.shape[1]
+        out = torch.empty_like(q)
         bs = k_cache.shape[1]
-        keys = k_cache[batch.block_tables].view(B, nb * bs, H, D).transpose(1, 2)
-        vals = v_cache[batch.block_tables].view(B, nb * bs, H, D).transpose(1, 2)
+        for g, mask in zip(batch.groups, masks):
+            Bg, Qg = g.index.shape
+            nb = g.block_tables.shape[1]
+            # 2) gather each sequence's whole context through its block table
+            keys = k_cache[g.block_tables].view(Bg, nb * bs, H, D).transpose(1, 2)
+            vals = v_cache[g.block_tables].view(Bg, nb * bs, H, D).transpose(1, 2)
+            # 3) masked attention: a query at position p sees keys 0..p
+            qg = q[g.index].transpose(1, 2)  # [Bg, H, Qg, D]
+            og = F.scaled_dot_product_attention(qg, keys, vals, attn_mask=mask).transpose(1, 2)
+            out[g.index[g.valid]] = og[g.valid]
 
-        # 3) masked attention: query at position p sees keys 0..p
-        out = F.scaled_dot_product_attention(q.transpose(1, 2), keys, vals, attn_mask=attn_mask)
-        x = x + self.c_proj(out.transpose(1, 2).reshape(B, Q, E))
+        x = x + self.c_proj(out.reshape(T, E))
         return x + self._mlp(x)
 
     def forward_dense(self, x: torch.Tensor) -> torch.Tensor:
@@ -124,17 +142,16 @@ class GPT2(nn.Module):
     @torch.inference_mode()
     def forward_paged(self, batch: BatchInput, cache: KVCache) -> torch.Tensor:
         """Run one step and return logits for each sequence's last token: [B, V]."""
-        B, Q = batch.tokens.shape
-        L = batch.block_tables.shape[1] * cache.block_size
-        key_pos = torch.arange(L, device=batch.tokens.device)
-        mask = (key_pos.view(1, 1, L) <= batch.positions.unsqueeze(-1)) & (
-            key_pos.view(1, 1, L) < batch.context_lens.view(B, 1, 1))
-        mask = mask.unsqueeze(1)  # [B, 1, Q, L]
+        masks = []
+        for g in batch.groups:
+            L = g.block_tables.shape[1] * cache.block_size
+            key_pos = torch.arange(L, device=batch.tokens.device).view(1, 1, L)
+            m = (key_pos <= g.positions.unsqueeze(-1)) & (key_pos < g.context_lens.view(-1, 1, 1))
+            masks.append(m.unsqueeze(1))  # [Bg, 1, Qg, L]
         x = self.wte(batch.tokens) + self.wpe(batch.positions)
         for i, blk in enumerate(self.h):
-            x = blk.forward_paged(x, batch, cache.k[i], cache.v[i], mask)
-        last = x[torch.arange(B, device=x.device), batch.last_index]
-        return self._logits(last)
+            x = blk.forward_paged(x, batch, cache.k[i], cache.v[i], masks)
+        return self._logits(x[batch.last_index])
 
     @torch.inference_mode()
     def forward_dense(self, tokens: torch.Tensor) -> torch.Tensor:
@@ -201,4 +218,4 @@ def kv_bytes_per_token(cfg: ModelConfig, dtype_bytes: int = 4) -> int:
     return 2 * cfg.n_layer * cfg.n_embd * dtype_bytes
 
 
-__all__ = ["BatchInput", "GPT2", "KVCache", "init_random", "load_gpt2", "param_count", "kv_bytes_per_token"]
+__all__ = ["AttnGroup", "BatchInput", "GPT2", "KVCache", "init_random", "load_gpt2", "param_count", "kv_bytes_per_token"]
