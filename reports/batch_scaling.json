@@ -1,0 +1,30 @@
+{
+  "1": {
+    "output_tok_s": 127.9,
+    "seconds": 0.5
+  },
+  "2": {
+    "output_tok_s": 113.9,
+    "seconds": 1.123
+  },
+  "4": {
+    "output_tok_s": 204.9,
+    "seconds": 1.25
+  },
+  "8": {
+    "output_tok_s": 385.8,
+    "seconds": 1.327
+  },
+  "16": {
+    "output_tok_s": 651.4,
+    "seconds": 1.572
+  },
+  "32": {
+    "output_tok_s": 927.5,
+    "seconds": 2.208
+  },
+  "64": {
+    "output_tok_s": 1083.9,
+    "seconds": 3.779
+  }
+}

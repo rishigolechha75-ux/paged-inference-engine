@@ -1,0 +1,7 @@
+{
+  "prompts": 24,
+  "tokens_per_prompt": 64,
+  "exact_match": 24,
+  "first_divergence_positions": [],
+  "max_abs_logit_diff_dense_vs_hf": 0.0
+}

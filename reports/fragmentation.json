@@ -1,0 +1,37 @@
+{
+  "reserve_max_tokens": {
+    "allocated": 52984,
+    "used": 23053,
+    "waste_pct": 56.49
+  },
+  "paged_block_1": {
+    "allocated": 23053,
+    "used": 23053,
+    "waste_pct": 0.0
+  },
+  "paged_block_8": {
+    "allocated": 23600,
+    "used": 23053,
+    "waste_pct": 2.32
+  },
+  "paged_block_16": {
+    "allocated": 24192,
+    "used": 23053,
+    "waste_pct": 4.71
+  },
+  "paged_block_32": {
+    "allocated": 25632,
+    "used": 23053,
+    "waste_pct": 10.06
+  },
+  "paged_block_64": {
+    "allocated": 28288,
+    "used": 23053,
+    "waste_pct": 18.51
+  },
+  "paged_block_128": {
+    "allocated": 34304,
+    "used": 23053,
+    "waste_pct": 32.8
+  }
+}

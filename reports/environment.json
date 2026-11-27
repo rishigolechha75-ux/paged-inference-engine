@@ -1,0 +1,25 @@
+{
+  "date": "2026-11-27",
+  "machine": "arm64",
+  "processor": "arm",
+  "python": "3.11.16",
+  "torch": "2.15.0",
+  "torch_threads": 4,
+  "device": "cpu",
+  "dtype": "float32",
+  "model": "openai-community/gpt2 (124M)",
+  "kv_bytes_per_token": 73728,
+  "kv_budget_tokens": 6144,
+  "kv_budget_mib": 432.0,
+  "max_tokens_cap": 256,
+  "workload": {
+    "dataset": "databricks-dolly-15k (CC BY-SA 3.0)",
+    "requests": 160,
+    "prompt_len_mean": 75.2,
+    "prompt_len_p50": 19.0,
+    "prompt_len_max": 454,
+    "output_len_mean": 68.9,
+    "output_len_p50": 44.0,
+    "output_len_max": 256
+  }
+}
