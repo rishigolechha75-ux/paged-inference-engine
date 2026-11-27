@@ -75,9 +75,10 @@ class Sequence:
 
     @property
     def is_prefill(self) -> bool:
-        # More than one token without K/V means a (possibly chunked or
-        # recomputed) prefill; exactly one means a plain decode step.
-        return self.num_uncomputed_tokens > 1
+        # Prompt tokens without K/V, or more than one uncomputed token after a
+        # preemption, mean a (possibly chunked) prefill; otherwise a decode.
+        return (self.num_computed_tokens < len(self.prompt_token_ids)
+                or self.num_uncomputed_tokens > 1)
 
     @property
     def num_uncomputed_tokens(self) -> int:
