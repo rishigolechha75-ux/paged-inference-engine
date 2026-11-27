@@ -128,3 +128,13 @@ def test_stats_and_kv_utilization(tiny_model, prompts):
     assert st.generated_tokens == len(prompts) * MAX_TOKENS
     assert st.prefill_tokens == sum(map(len, prompts))
     assert all(0 <= u <= 1 for u in st.kv_util_samples)
+
+
+def test_stop_after_ends_early_but_reserve_uses_max_tokens(tiny_model):
+    engine = LLMEngine(tiny_model, EngineConfig(block_size=4, num_blocks=50, reserve_max=True, max_model_len=256))
+    seq = engine.add_request([1, 2, 3, 4], SamplingParams(max_tokens=40, stop_after=3, ignore_eos=True))
+    engine.step()
+    assert len(seq.block_table) == 11  # (4 + 40) / 4 reserved up front
+    while engine.has_unfinished():
+        engine.step()
+    assert len(seq.output_token_ids) == 3 and seq.finish_reason == "stop"

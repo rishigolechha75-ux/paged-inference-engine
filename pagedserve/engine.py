@@ -184,6 +184,8 @@ class LLMEngine:
         p = seq.params
         if not p.ignore_eos and p.eos_token_id is not None and token == p.eos_token_id:
             return "stop"
+        if p.stop_after is not None and len(seq.output_token_ids) >= min(p.stop_after, p.max_tokens):
+            return "stop" if p.stop_after < p.max_tokens else "length"
         if len(seq.output_token_ids) >= p.max_tokens:
             return "length"
         if seq.num_tokens >= self.cfg.max_model_len:

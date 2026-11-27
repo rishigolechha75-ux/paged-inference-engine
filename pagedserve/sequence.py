@@ -23,6 +23,10 @@ class SamplingParams:
     seed: Optional[int] = None
     ignore_eos: bool = False
     eos_token_id: Optional[int] = 50256
+    # Benchmark hook: behave as if EOS were sampled after this many tokens.
+    # Lets a workload replay real response lengths while ``max_tokens`` stays
+    # the client-side cap that a reserving allocator must plan for.
+    stop_after: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.max_tokens < 1:
@@ -31,6 +35,8 @@ class SamplingParams:
             raise ValueError("temperature must be >= 0")
         if not 0 < self.top_p <= 1:
             raise ValueError("top_p must be in (0, 1]")
+        if self.stop_after is not None and self.stop_after < 1:
+            raise ValueError("stop_after must be >= 1")
         if self.top_k < 0:
             raise ValueError("top_k must be >= 0")
 
